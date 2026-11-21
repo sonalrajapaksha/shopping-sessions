@@ -10,6 +10,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -592,12 +593,20 @@ fn main() {
     tm("dedup");
 
     // ---- clicks ----
-    let cl_chunks = chunks_of(&list_csv(&data_dir.join("clicks")));
-    let cl_accs: Vec<Vec<Vec<Cl>>> = cl_chunks
+    // Each chunk is parsed into a reused per-thread scratch, then counting-sorted by person
+    // bucket into one exactly-sized Vec (no growth reallocs / fresh-page faults).
+    struct ClChunk {
+        cls: Vec<Cl>,
+        off: Vec<u32>, // NB2 + 1 offsets
+    }
+    let cl_chunks_in = chunks_of(&list_csv(&data_dir.join("clicks")));
+    let cl_chunks: Vec<ClChunk> = cl_chunks_in
         .par_iter()
-        .fold(
-            || (0..NB2).map(|_| Vec::new()).collect::<Vec<Vec<Cl>>>(),
-            |mut acc, c| {
+        .map_init(
+            || (Vec::<Cl>::new(), Vec::<u16>::new()),
+            |(scr, bk), c| {
+                scr.clear();
+                bk.clear();
                 for_lines(c, |l| {
                     let Some([cid, user, camp, ts]) = fields::<4>(l) else { return };
                     if cid.is_empty() || user.is_empty() {
@@ -610,41 +619,71 @@ fn main() {
                     let Some(&ci) = ctx.camp_of.get(&hash128(camp)) else { return };
                     let key = resolve(&ctx, user);
                     let pb = ((key.0 >> 32) as usize * NB2) >> 32;
-                    acc[pb].push(Cl { key, ts: t, cptr: cid.as_ptr() as usize, clen: cid.len() as u32, camp: ci });
+                    bk.push(pb as u16);
+                    scr.push(Cl { key, ts: t, cptr: cid.as_ptr() as usize, clen: cid.len() as u32, camp: ci });
                 });
-                acc
+                let mut off = vec![0u32; NB2 + 1];
+                for &b in bk.iter() {
+                    off[b as usize + 1] += 1;
+                }
+                for i in 0..NB2 {
+                    off[i + 1] += off[i];
+                }
+                let n = scr.len();
+                let mut cls: Vec<Cl> = Vec::with_capacity(n);
+                let mut cur: Vec<u32> = off[..NB2].to_vec();
+                let dst = cls.as_mut_ptr();
+                for (i, &b) in bk.iter().enumerate() {
+                    let d = cur[b as usize] as usize;
+                    cur[b as usize] += 1;
+                    // SAFETY: d < n by construction of the prefix sums; each slot written once.
+                    unsafe { dst.add(d).write(scr[i]) };
+                }
+                unsafe { cls.set_len(n) };
+                ClChunk { cls, off }
             },
         )
         .collect();
     tm("clicks parsed");
 
     // ---- sessionize + attribute ----
+    // Exactly one Worker (and one set of scratch buffers) per thread; buckets are handed out dynamically.
     let ncat = cats.len() + 1;
     let day0 = ws.div_euclid(DAY_MS);
     let day1 = (we - 1).div_euclid(DAY_MS);
     let ndays = (day1 - day0 + 1) as usize;
-    let workers: Vec<Worker> = (0..NB2)
+    let nthreads = rayon::current_num_threads().max(1);
+    let next_bucket = AtomicUsize::new(0);
+    let workers: Vec<Worker> = (0..nthreads)
         .into_par_iter()
-        .fold(
-            || Worker {
+        .with_min_len(1)
+        .with_max_len(1)
+        .map(|_| {
+            let mut w = Worker {
                 camp: vec![[0; 5]; (ncamp + 1) * ndays],
                 ud: vec![],
                 cnt: vec![0; ncamp],
                 pos: vec![0; ncamp],
                 active: vec![],
                 cat_sum: vec![0; ncat],
-            },
-            |mut w, p| {
-                let mut evs: Vec<Ev> = Vec::new();
+            };
+            let mut evs: Vec<Ev> = Vec::new();
+            let mut cls: Vec<Cl> = Vec::new();
+            loop {
+                let p = next_bucket.fetch_add(1, Ordering::Relaxed);
+                if p >= NB2 {
+                    break;
+                }
+                evs.clear();
                 for part in &parts {
                     evs.extend_from_slice(&part[p]);
                 }
                 if evs.is_empty() {
-                    return w;
+                    continue;
                 }
-                let mut cls: Vec<Cl> = Vec::new();
-                for a in &cl_accs {
-                    cls.extend_from_slice(&a[p]);
+                cls.clear();
+                for ch in &cl_chunks {
+                    cls.extend_from_slice(&ch.cls[ch.off[p] as usize..ch.off[p + 1] as usize]);
                 }
                 evs.sort_unstable_by_key(|e| (e.key, e.ts));
                 cls.sort_unstable_by_key(|c| (c.key, c.ts));
@@ -679,12 +718,12 @@ fn main() {
                     ci = ce;
                     s = e;
                 }
-                w
-            },
-        )
+            }
+            w
+        })
         .collect();
     drop(parts);
-    drop(cl_accs);
+    drop(cl_chunks);
     tm("sessions");
 
     // ---- output ----
@@ -861,73 +900,253 @@ fn props() -> Arc<WriterProperties> {
 }
 
 fn write_user_daily(dir: &Path, workers: &[Worker], cats: &[B]) {
-    let schema = Arc::new(
-        parse_message_type(
-            "message m { required binary user_id (STRING); required int32 day (DATE); required int32 sessions; required int32 events; required int64 revenue_cents; optional binary top_category (STRING); }",
-        )
-        .unwrap(),
-    );
-    let p = props();
-    let all: Vec<&Vec<UdRow>> = workers.iter().map(|w| &w.ud).collect();
-    let total: usize = all.iter().map(|v| v.len()).sum();
+    let total: usize = workers.iter().map(|w| w.ud.len()).sum();
     let nthreads = rayon::current_num_threads().max(1);
     let per = ((total + nthreads * 2 - 1) / (nthreads * 2)).max(1);
-    let mut jobs: Vec<(usize, Vec<&UdRow>)> = vec![];
-    let mut cur: Vec<&UdRow> = Vec::with_capacity(per);
-    let mut idx = 0;
-    for v in &all {
-        for r in v.iter() {
-            cur.push(r);
-            if cur.len() == per {
-                jobs.push((idx, std::mem::replace(&mut cur, Vec::with_capacity(per))));
-                idx += 1;
-            }
+    // jobs are slices straight out of each worker's row vec: no per-row pointer vec, no serial pass
+    let mut jobs: Vec<(usize, &[UdRow])> = vec![];
+    for w in workers {
+        for sl in w.ud.chunks(per) {
+            jobs.push((jobs.len(), sl));
         }
     }
-    if !cur.is_empty() || jobs.is_empty() {
-        jobs.push((idx, cur));
+    if jobs.is_empty() {
+        jobs.push((0, &[]));
     }
     jobs.par_iter().for_each(|(i, rows)| {
-        let f = std::fs::File::create(dir.join(format!("part-{:05}.parquet", i))).unwrap();
-        let mut w = SerializedFileWriter::new(f, schema.clone(), p.clone()).unwrap();
-        let mut rg = w.next_row_group().unwrap();
-        let mut c = rg.next_column().unwrap().unwrap();
-        let v: Vec<ByteArray> = rows.iter().map(|r| ba(slice_of(r.nptr, r.nlen))).collect();
-        c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
-        c.close().unwrap();
-        let mut c = rg.next_column().unwrap().unwrap();
-        let v: Vec<i32> = rows.iter().map(|r| r.day).collect();
-        c.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
-        c.close().unwrap();
-        let mut c = rg.next_column().unwrap().unwrap();
-        let v: Vec<i32> = rows.iter().map(|r| r.sessions as i32).collect();
-        c.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
-        c.close().unwrap();
-        let mut c = rg.next_column().unwrap().unwrap();
-        let v: Vec<i32> = rows.iter().map(|r| r.events as i32).collect();
-        c.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
-        c.close().unwrap();
-        let mut c = rg.next_column().unwrap().unwrap();
-        let v: Vec<i64> = rows.iter().map(|r| r.revenue as i64).collect();
-        c.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
-        c.close().unwrap();
-        let mut c = rg.next_column().unwrap().unwrap();
-        let mut defs: Vec<i16> = Vec::with_capacity(rows.len());
-        let mut vals: Vec<ByteArray> = vec![];
-        for r in rows.iter() {
-            if r.top == 255 {
-                defs.push(0);
-            } else {
-                defs.push(1);
-                let name: &[u8] = if (r.top as usize) < cats.len() { cats[r.top as usize] } else { b"unknown" };
-                vals.push(ba(name));
+        let n = rows.len();
+        let mut f = ParquetFile::new();
+        f.col_str(
+            "user_id",
+            false,
+            n,
+            n * 4 + rows.iter().map(|r| r.nlen as usize).sum::<usize>(),
+            None,
+            |o| {
+                for r in rows.iter() {
+                    o.extend_from_slice(&r.nlen.to_le_bytes());
+                    o.extend_from_slice(slice_of(r.nptr, r.nlen));
+                }
+            },
+        );
+        f.col_fixed("day", T_INT32, Some(6), n, 4, |o| {
+            for r in rows.iter() {
+                o.extend_from_slice(&r.day.to_le_bytes());
             }
-        }
-        c.typed::<ByteArrayType>().write_batch(&vals, Some(&defs), None).unwrap();
-        c.close().unwrap();
-        rg.close().unwrap();
-        w.close().unwrap();
+        });
+        f.col_fixed("sessions", T_INT32, None, n, 4, |o| {
+            for r in rows.iter() {
+                o.extend_from_slice(&r.sessions.to_le_bytes());
+            }
+        });
+        f.col_fixed("events", T_INT32, None, n, 4, |o| {
+            for r in rows.iter() {
+                o.extend_from_slice(&r.events.to_le_bytes());
+            }
+        });
+        f.col_fixed("revenue_cents", T_INT64, None, n, 8, |o| {
+            for r in rows.iter() {
+                o.extend_from_slice(&r.revenue.to_le_bytes());
+            }
+        });
+        let nonnull = rows.iter().filter(|r| r.top != 255).count();
+        let name_of = |t: u8| -> &[u8] { if (t as usize) < cats.len() { cats[t as usize] } else { b"unknown" } };
+        let vbytes: usize = rows.iter().filter(|r| r.top != 255).map(|r| 4 + name_of(r.top).len()).sum();
+        f.col_str("top_category", true, n, vbytes, Some(nonnull), |o| {
+            // definition levels: one bit-packed RLE-hybrid run, 1 bit per value
+            let groups = (n + 7) / 8;
+            let mut hdr = vec![];
+            put_uvarint(&mut hdr, ((groups as u64) << 1) | 1);
+            o.extend_from_slice(&((hdr.len() + groups) as u32).to_le_bytes());
+            o.extend_from_slice(&hdr);
+            for g in 0..groups {
+                let mut byte = 0u8;
+                for k in 0..8 {
+                    if let Some(r) = rows.get(g * 8 + k) {
+                        if r.top != 255 {
+                            byte |= 1 << k;
+                        }
+                    }
+                }
+                o.push(byte);
+            }
+            for r in rows.iter() {
+                if r.top != 255 {
+                    let nm = name_of(r.top);
+                    o.extend_from_slice(&(nm.len() as u32).to_le_bytes());
+                    o.extend_from_slice(nm);
+                }
+            }
+        });
+        f.finish(&dir.join(format!("part-{:05}.parquet", i)), n);
     });
+}
+
+// ---------- minimal hand-written parquet (PLAIN, UNCOMPRESSED, v1 data pages, one row group) ----------
+const T_INT32: i32 = 1;
+const T_INT64: i32 = 2;
+const T_BYTES: i32 = 6;
+
+fn put_uvarint(o: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        o.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    o.push(v as u8);
+}
+fn put_zz(o: &mut Vec<u8>, v: i64) {
+    put_uvarint(o, ((v << 1) ^ (v >> 63)) as u64);
+}
+// thrift compact: field header with explicit (non-delta) id for simplicity
+fn fld(o: &mut Vec<u8>, id: i16, ty: u8) {
+    o.push(ty);
+    put_zz(o, id as i64);
+}
+fn fld_i32(o: &mut Vec<u8>, id: i16, v: i32) {
+    fld(o, id, 5);
+    put_zz(o, v as i64);
+}
+fn fld_i64(o: &mut Vec<u8>, id: i16, v: i64) {
+    fld(o, id, 6);
+    put_zz(o, v);
+}
+fn fld_str(o: &mut Vec<u8>, id: i16, s: &str) {
+    fld(o, id, 8);
+    put_uvarint(o, s.len() as u64);
+    o.extend_from_slice(s.as_bytes());
+}
+fn list_hdr(o: &mut Vec<u8>, n: usize, ty: u8) {
+    if n < 15 {
+        o.push(((n as u8) << 4) | ty);
+    } else {
+        o.push(0xF0 | ty);
+        put_uvarint(o, n as u64);
+    }
+}
+
+struct ColMeta {
+    name: &'static str,
+    ty: i32,
+    conv: Option<i32>, // converted type: 0 = UTF8, 6 = DATE
+    optional: bool,
+    offset: i64,
+    size: i64,
+    num_values: i64,
+}
+
+struct ParquetFile {
+    buf: Vec<u8>,
+    cols: Vec<ColMeta>,
+}
+
+impl ParquetFile {
+    fn new() -> Self {
+        ParquetFile { buf: b"PAR1".to_vec(), cols: vec![] }
+    }
+    // append a data page: header + body written by `body`
+    fn page(&mut self, name: &'static str, ty: i32, conv: Option<i32>, optional: bool, nvals: usize, body_len: usize, body: impl FnOnce(&mut Vec<u8>)) {
+        let mut h = Vec::with_capacity(24);
+        fld_i32(&mut h, 1, 0); // DATA_PAGE
+        fld_i32(&mut h, 2, body_len as i32);
+        fld_i32(&mut h, 3, body_len as i32);
+        fld(&mut h, 5, 12);
+        fld_i32(&mut h, 1, nvals as i32);
+        fld_i32(&mut h, 2, 0); // PLAIN
+        fld_i32(&mut h, 3, 3); // def levels: RLE
+        fld_i32(&mut h, 4, 3); // rep levels: RLE
+        h.push(0);
+        h.push(0);
+        let offset = self.buf.len() as i64;
+        self.buf.reserve(h.len() + body_len);
+        self.buf.extend_from_slice(&h);
+        let start = self.buf.len();
+        body(&mut self.buf);
+        debug_assert_eq!(self.buf.len() - start, body_len);
+        let size = self.buf.len() as i64 - offset;
+        self.cols.push(ColMeta { name, ty, conv, optional, offset, size, num_values: nvals as i64 });
+    }
+    fn col_fixed(&mut self, name: &'static str, ty: i32, conv: Option<i32>, n: usize, w: usize, body: impl FnOnce(&mut Vec<u8>)) {
+        self.page(name, ty, conv, false, n, n * w, body);
+    }
+    // string column; for optional, `nonnull` is the number of present values and body writes levels + values
+    fn col_str(&mut self, name: &'static str, optional: bool, n: usize, vbytes: usize, nonnull: Option<usize>, body: impl FnOnce(&mut Vec<u8>)) {
+        let lv = if optional {
+            let groups = (n + 7) / 8;
+            let mut t = vec![];
+            put_uvarint(&mut t, ((groups as u64) << 1) | 1);
+            4 + t.len() + groups
+        } else {
+            0
+        };
+        let _ = nonnull;
+        self.page(name, T_BYTES, Some(0), optional, n, lv + vbytes, body);
+    }
+    fn finish(mut self, path: &Path, nrows: usize) {
+        let mut m = Vec::with_capacity(1024);
+        fld_i32(&mut m, 1, 1); // version
+        fld(&mut m, 2, 9);
+        list_hdr(&mut m, self.cols.len() + 1, 12);
+        // root
+        fld_i32(&mut m, 3, 0);
+        fld_str(&mut m, 4, "m");
+        fld_i32(&mut m, 5, self.cols.len() as i32);
+        m.push(0);
+        for c in &self.cols {
+            fld_i32(&mut m, 1, c.ty);
+            fld_i32(&mut m, 3, if c.optional { 1 } else { 0 });
+            fld_str(&mut m, 4, c.name);
+            if let Some(cv) = c.conv {
+                fld_i32(&mut m, 6, cv);
+                fld(&mut m, 10, 12); // logicalType union
+                fld(&mut m, if cv == 0 { 1 } else { 6 }, 12);
+                m.push(0);
+                m.push(0);
+            }
+            m.push(0);
+        }
+        fld_i64(&mut m, 3, nrows as i64);
+        fld(&mut m, 4, 9);
+        list_hdr(&mut m, 1, 12);
+        // row group
+        fld(&mut m, 1, 9);
+        list_hdr(&mut m, self.cols.len(), 12);
+        let mut total = 0i64;
+        for c in &self.cols {
+            total += c.size;
+            fld_i64(&mut m, 2, c.offset);
+            fld(&mut m, 3, 12);
+            fld_i32(&mut m, 1, c.ty);
+            fld(&mut m, 2, 9);
+            if c.optional {
+                list_hdr(&mut m, 2, 5);
+                put_zz(&mut m, 0);
+                put_zz(&mut m, 3);
+            } else {
+                list_hdr(&mut m, 1, 5);
+                put_zz(&mut m, 0);
+            }
+            fld(&mut m, 3, 9);
+            list_hdr(&mut m, 1, 8);
+            put_uvarint(&mut m, c.name.len() as u64);
+            m.extend_from_slice(c.name.as_bytes());
+            fld_i32(&mut m, 4, 0); // UNCOMPRESSED
+            fld_i64(&mut m, 5, c.num_values);
+            fld_i64(&mut m, 6, c.size);
+            fld_i64(&mut m, 7, c.size);
+            fld_i64(&mut m, 9, c.offset);
+            m.push(0); // end ColumnMetaData
+            m.push(0); // end ColumnChunk
+        }
+        fld_i64(&mut m, 2, total);
+        fld_i64(&mut m, 3, nrows as i64);
+        m.push(0); // end RowGroup
+        fld_str(&mut m, 6, "shopping-fast");
+        m.push(0); // end FileMetaData
+        self.buf.extend_from_slice(&m);
+        self.buf.extend_from_slice(&(m.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(b"PAR1");
+        std::fs::write(path, &self.buf).unwrap();
+    }
 }
 
 fn write_campaign_daily(dir: &Path, tot: &[[u64; 5]], camps: &[(B, B)], day0: i64, ndays: usize, ncamp: usize) {
