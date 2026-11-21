@@ -513,8 +513,9 @@ fn build_links(link_chunks: &[B]) -> (LinkTable, IdMap<(usize, u32)>) {
         sa: B,
         sb: B,
     }
+    // serial: runs on its own OS thread next to the rayon pool (see main)
     let link_rows: Vec<Vec<LinkRow>> = link_chunks
-        .par_iter()
+        .iter()
         .map(|c| {
             let mut v = vec![];
             scan::for_lines_split::<2>(c, |_, f| {
@@ -785,11 +786,23 @@ fn main() {
     let mut links_out: Option<(LinkTable, IdMap<(usize, u32)>)> = None;
     let mut cl_raw: Vec<Vec<Cl>> = vec![];
     let mut accs: Vec<ChunkOut> = vec![];
-    rayon::scope(|s| {
-        // spawned first so an idle thread steals it first: its serial union-find overlaps parsing
-        s.spawn(|_| links_out = Some(build_links(&link_chunks)));
-        s.spawn(|_| cl_raw = parse_clicks(&cl_chunks_in, &pctx));
-        accs = parse_events(&ev_chunks, &pctx);
+    std::thread::scope(|ts| {
+        // Links (small, mostly serial union-find) get a dedicated OS thread so they never wait
+        // behind event chunks in the rayon queues; the pool parses events and clicks meanwhile.
+        let lh = ts.spawn(|| {
+            let r = build_links(&link_chunks);
+            tm("  links done");
+            r
+        });
+        rayon::scope(|s| {
+            s.spawn(|_| {
+                cl_raw = parse_clicks(&cl_chunks_in, &pctx);
+                tm("  clicks parsed");
+            });
+            accs = parse_events(&ev_chunks, &pctx);
+            tm("  events parsed");
+        });
+        links_out = Some(lh.join().unwrap());
     });
     let (links, names) = links_out.unwrap();
     tm("parsed");
