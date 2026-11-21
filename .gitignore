@@ -10,3 +10,4 @@ output/
 scratch/
 benchmarks/results/
 .DS_Store
+.tmp/

@@ -2,7 +2,7 @@
 
 This is the official DuckDB starter with local development and benchmarking tools. The challenge is to process shopping events into exact `user_daily` and `campaign_daily` outputs. The fastest **exactly correct** solution wins; consult the [official challenge](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) for current scoring and submission details. [rules.md](rules.md) is authoritative for the data specification.
 
-**Implementation status:** the starter writes correctly shaped but empty tables. It is not a solution and correctness checks are expected to fail until `pipeline/pipeline.py` implements the rules.
+**Implementation status:** `pipeline/pipeline.py` implements the full pipeline. All 36 fixtures pass and the 1M-event dev output matches the official reference exactly (both under Docker linux/amd64). Design: CSV files are read as raw text (`read_text`) and parsed in SQL so the dialect rules hold exactly (DuckDB's CSV reader repairs lines the rules drop); dedup uses `arg_min` over a struct (a bare `arg_min` skips copies whose value is NULL, which would let a later valid copy rescue an invalid kept one); identity uses a Python union-find over dense ids; sessions use window functions; last-touch uses an `ASOF` join over one click per (person, ts); assists merge each (person, campaign)'s 7-day coverage windows into disjoint intervals so no session-click product is built. Timings: dev 1M events 17.6s under amd64 emulation (8.0s native arm64); seed 7 / 5M events 45s native. Main bottleneck: parsing and dedup of events (about 2/3 of runtime, limited by per-file parallelism of `read_text`). No oracle exists for other seeds; they were only checked for crashes and the rules' self-check invariants.
 
 ## Layout and prerequisites
 
