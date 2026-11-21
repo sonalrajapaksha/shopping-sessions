@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type B = &'static [u8];
 type Key = (u64, u64);
 
@@ -553,18 +556,29 @@ fn main() {
         .into_par_iter()
         .map(|b| {
             let total: usize = accs.iter().map(|a| a[b].len()).sum();
-            let mut v: Vec<Pre> = Vec::with_capacity(total);
-            for a in &accs {
-                v.extend_from_slice(&a[b]);
+            // compact 32-byte sort keys; payload stays in place and is gathered for survivors
+            #[derive(Clone, Copy)]
+            struct SK {
+                e: Key,
+                ingest: i64,
+                ai: u32,
+                pos: u32,
+            }
+            let mut v: Vec<SK> = Vec::with_capacity(total);
+            for (ai, a) in accs.iter().enumerate() {
+                for (pos, p) in a[b].iter().enumerate() {
+                    v.push(SK { e: p.e, ingest: p.ingest, ai: ai as u32, pos: pos as u32 });
+                }
             }
             v.sort_unstable_by(|x, y| (x.e, x.ingest).cmp(&(y.e, y.ingest)));
             let mut out: Vec<Vec<Ev>> = (0..NB2).map(|_| Vec::new()).collect();
             let mut last: Option<Key> = None;
-            for p in &v {
-                if last == Some(p.e) {
+            for k in &v {
+                if last == Some(k.e) {
                     continue;
                 }
-                last = Some(p.e);
+                last = Some(k.e);
+                let p = &accs[k.ai as usize][b][k.pos as usize];
                 if p.ts == i64::MIN {
                     continue;
                 }
