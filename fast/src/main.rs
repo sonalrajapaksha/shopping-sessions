@@ -586,20 +586,21 @@ fn main() {
     tm("events parsed");
 
     // ---- dedup + repartition by person ----
+    // compact 32-byte sort keys; payload stays in place and is gathered for survivors
+    #[derive(Clone, Copy)]
+    struct SK {
+        e: Key,
+        ingest: i64,
+        ai: u32,
+        pos: u32,
+    }
     let parts: Vec<Part> = (0..NB1)
         .into_par_iter()
-        .map(|b| {
+        .map_init(|| (Vec::<SK>::new(), Vec::<Ev>::new()), |(v, surv), b| {
             let sl = |a: &ChunkOut| (a.off[b] as usize, a.off[b + 1] as usize);
             let total: usize = accs.iter().map(|a| { let (x, y) = sl(a); y - x }).sum();
-            // compact 32-byte sort keys; payload stays in place and is gathered for survivors
-            #[derive(Clone, Copy)]
-            struct SK {
-                e: Key,
-                ingest: i64,
-                ai: u32,
-                pos: u32,
-            }
-            let mut v: Vec<SK> = Vec::with_capacity(total);
+            v.clear();
+            v.reserve(total);
             for (ai, a) in accs.iter().enumerate() {
                 let (x, y) = sl(a);
                 for (i, p) in a.recs[x..y].iter().enumerate() {
@@ -607,9 +608,10 @@ fn main() {
                 }
             }
             v.sort_unstable_by(|x, y| (x.e, x.ingest).cmp(&(y.e, y.ingest)));
-            let mut surv: Vec<Ev> = Vec::with_capacity(total);
+            surv.clear();
+            surv.reserve(total);
             let mut last: Option<Key> = None;
-            for k in &v {
+            for k in v.iter() {
                 if last == Some(k.e) {
                     continue;
                 }
@@ -620,10 +622,9 @@ fn main() {
                 }
                 surv.push(Ev { key: p.key, ts: p.ts, uptr: p.uptr, ulen: p.ulen, pc: p.pc });
             }
-            drop(v);
             let pb = |e: &Ev| ((e.key.0 >> 32) as usize * NB2) >> 32;
             let mut off = vec![0u32; NB2 + 1];
-            for e in &surv {
+            for e in surv.iter() {
                 off[pb(e) + 1] += 1;
             }
             for i in 0..NB2 {
@@ -633,7 +634,7 @@ fn main() {
             let mut evs: Vec<Ev> = Vec::with_capacity(n);
             let mut cur: Vec<u32> = off[..NB2].to_vec();
             let dst = evs.as_mut_ptr();
-            for e in &surv {
+            for e in surv.iter() {
                 let q = pb(e);
                 unsafe { dst.add(cur[q] as usize).write(*e) };
                 cur[q] += 1;
