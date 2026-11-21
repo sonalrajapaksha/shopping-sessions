@@ -517,6 +517,24 @@ fn build_links(link_chunks: &[B]) -> (IdMap<Key>, IdMap<(usize, u32)>) {
 
 }
 
+// ---------- per-thread scratch ----------
+/// One reusable scratch value per rayon worker thread. (`map_init` calls its init once per
+/// split, not per thread, so its buffers are re-allocated and their pages faulted again.)
+struct PerThread<T>(Vec<std::sync::Mutex<T>>);
+impl<T: Default> PerThread<T> {
+    fn new() -> Self {
+        PerThread((0..rayon::current_num_threads().max(1)).map(|_| Default::default()).collect())
+    }
+    #[inline]
+    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let i = rayon::current_thread_index().unwrap_or(0) % self.0.len();
+        match self.0[i].try_lock() {
+            Ok(mut g) => f(&mut g),
+            Err(_) => f(&mut T::default()), // never expected; stays correct regardless
+        }
+    }
+}
+
 // ---------- parse phases ----------
 /// Parsed events of one chunk, counting-sorted by dedup bucket.
 struct ChunkOut {
@@ -527,9 +545,10 @@ struct ChunkOut {
 /// Each chunk is parsed into a reused per-thread scratch buffer, then counting-sorted by
 /// dedup bucket into one exactly-sized Vec (no doubling growth, no 256 x accumulators).
 fn parse_events(ev_chunks: &[B], ctx: &PCtx) -> Vec<ChunkOut> {
+    let scr = PerThread::<Vec<Pre>>::new();
     ev_chunks
         .par_iter()
-        .map_init(Vec::<Pre>::new, |scratch, c| {
+        .map(|c| scr.with(|scratch| {
             scratch.clear();
             scratch.reserve(c.len() / 64 + 16);
             scan::for_lines_split::<7>(
@@ -560,7 +579,7 @@ fn parse_events(ev_chunks: &[B], ctx: &PCtx) -> Vec<ChunkOut> {
             }
             unsafe { recs.set_len(n) };
             ChunkOut { recs, off }
-        })
+        }))
         .collect()
 }
 
@@ -594,8 +613,9 @@ struct ClChunk {
     off: Vec<u32>, // NB2 + 1 offsets
 }
 fn bucket_clicks(raw: &[Vec<Cl>], links: &IdMap<Key>) -> Vec<ClChunk> {
+    let kss = PerThread::<Vec<Key>>::new();
     raw.par_iter()
-        .map_init(Vec::<Key>::new, |ks, scr| {
+        .map(|scr| kss.with(|ks| {
             ks.clear();
             ks.extend(scr.iter().map(|c| resolve_h(links, c.key)));
             let bk = |k: &Key| ((k.0 >> 32) as usize * NB2) >> 32;
@@ -621,7 +641,7 @@ fn bucket_clicks(raw: &[Vec<Cl>], links: &IdMap<Key>) -> Vec<ClChunk> {
             }
             unsafe { cls.set_len(n) };
             ClChunk { cls, off }
-        })
+        }))
         .collect()
 }
 
@@ -719,9 +739,10 @@ fn main() {
         pos: u32,
     }
     const EMPTY: Slot = Slot { e: (0, 0), ingest: 0, ai: u32::MAX, pos: 0 };
+    let dscr = PerThread::<(Vec<Slot>, Vec<Ev>)>::new();
     let dedup = || -> Vec<Part> { (0..NB1)
         .into_par_iter()
-        .map_init(|| (Vec::<Slot>::new(), Vec::<Ev>::new()), |(table, surv), b| {
+        .map(|b| dscr.with(|(table, surv)| {
             let sl = |a: &ChunkOut| (a.off[b] as usize, a.off[b + 1] as usize);
             let total: usize = accs.iter().map(|a| { let (x, y) = sl(a); y - x }).sum();
             let cap = (total * 2).next_power_of_two().max(16);
@@ -780,11 +801,13 @@ fn main() {
             }
             unsafe { evs.set_len(n) };
             Part { evs, off }
-        })
+        }))
         .collect() };
     let (parts, cl_chunks) = rayon::join(dedup, || bucket_clicks(&cl_raw, &links));
-    drop(accs);
-    drop(cl_raw);
+    // Never freed: unmapping from a running multi-threaded process costs TLB shootdowns on
+    // every worker; the pages go back at exit.
+    std::mem::forget(accs);
+    std::mem::forget(cl_raw);
     tm("dedup + clicks bucketed");
 
     // ---- sessionize + attribute ----
@@ -794,6 +817,15 @@ fn main() {
     let day1 = (we - 1).div_euclid(DAY_MS);
     let ndays = (day1 - day0 + 1) as usize;
     let nthreads = rayon::current_num_threads().max(1);
+    // Largest buckets first (whale persons), so no big bucket starts last and runs alone.
+    let mut order: Vec<(u32, u32)> = (0..NB2)
+        .map(|p| {
+            let n: usize = parts.iter().map(|x| (x.off[p + 1] - x.off[p]) as usize).sum::<usize>()
+                + cl_chunks.iter().map(|c| ((c.off[p + 1] - c.off[p]) / 2) as usize).sum::<usize>();
+            (n as u32, p as u32)
+        })
+        .collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
     let next_bucket = AtomicUsize::new(0);
     let workers: Vec<Worker> = (0..nthreads)
         .into_par_iter()
@@ -811,10 +843,11 @@ fn main() {
             let mut evs: Vec<Ev> = Vec::new();
             let mut cls: Vec<Cl> = Vec::new();
             loop {
-                let p = next_bucket.fetch_add(1, Ordering::Relaxed);
-                if p >= NB2 {
+                let i = next_bucket.fetch_add(1, Ordering::Relaxed);
+                if i >= NB2 {
                     break;
                 }
+                let p = order[i].1 as usize;
                 evs.clear();
                 for part in &parts {
                     evs.extend_from_slice(part.get(p));
@@ -863,8 +896,8 @@ fn main() {
             w
         })
         .collect();
-    drop(parts);
-    drop(cl_chunks);
+    std::mem::forget(parts);
+    std::mem::forget(cl_chunks);
     tm("sessions");
 
     // ---- output ----
