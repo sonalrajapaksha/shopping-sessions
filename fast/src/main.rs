@@ -669,36 +669,53 @@ fn main() {
     tm("parsed");
 
     // ---- dedup + repartition by person ----
-    // compact 32-byte sort keys; payload stays in place and is gathered for survivors
+    // Per event-id bucket: open-addressed hash insertion keyed by the 128-bit event-id hash,
+    // keeping the copy with the smallest ingest_ts (on equal ingest_ts the first seen stays;
+    // such copies are identical per rules.md). The winner's payload is gathered afterwards.
     #[derive(Clone, Copy)]
-    struct SK {
+    struct Slot {
         e: Key,
         ingest: i64,
-        ai: u32,
+        ai: u32, // u32::MAX = empty
         pos: u32,
     }
+    const EMPTY: Slot = Slot { e: (0, 0), ingest: 0, ai: u32::MAX, pos: 0 };
     let dedup = || -> Vec<Part> { (0..NB1)
         .into_par_iter()
-        .map_init(|| (Vec::<SK>::new(), Vec::<Ev>::new()), |(v, surv), b| {
+        .map_init(|| (Vec::<Slot>::new(), Vec::<Ev>::new()), |(table, surv), b| {
             let sl = |a: &ChunkOut| (a.off[b] as usize, a.off[b + 1] as usize);
             let total: usize = accs.iter().map(|a| { let (x, y) = sl(a); y - x }).sum();
-            v.clear();
-            v.reserve(total);
+            let cap = (total * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            table.clear();
+            table.resize(cap, EMPTY);
             for (ai, a) in accs.iter().enumerate() {
                 let (x, y) = sl(a);
                 for (i, p) in a.recs[x..y].iter().enumerate() {
-                    v.push(SK { e: p.e, ingest: p.ingest, ai: ai as u32, pos: (x + i) as u32 });
+                    // e.0's high bits chose the bucket; e.1 is independent of them
+                    let mut h = p.e.1 as usize & mask;
+                    loop {
+                        let s = unsafe { table.get_unchecked_mut(h) };
+                        if s.ai == u32::MAX {
+                            *s = Slot { e: p.e, ingest: p.ingest, ai: ai as u32, pos: (x + i) as u32 };
+                            break;
+                        }
+                        if s.e == p.e {
+                            if p.ingest < s.ingest {
+                                *s = Slot { e: p.e, ingest: p.ingest, ai: ai as u32, pos: (x + i) as u32 };
+                            }
+                            break;
+                        }
+                        h = (h + 1) & mask;
+                    }
                 }
             }
-            v.sort_unstable_by(|x, y| (x.e, x.ingest).cmp(&(y.e, y.ingest)));
             surv.clear();
             surv.reserve(total);
-            let mut last: Option<Key> = None;
-            for k in v.iter() {
-                if last == Some(k.e) {
+            for k in table.iter() {
+                if k.ai == u32::MAX {
                     continue;
                 }
-                last = Some(k.e);
                 let p = &accs[k.ai as usize].recs[k.pos as usize];
                 if p.ts == i64::MIN {
                     continue;
