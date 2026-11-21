@@ -366,13 +366,79 @@ struct PCtx {
     camp_of: IdMap<u32>,
 }
 
-/// Map a user-id hash to its person key (the hash of the person's name).
-#[inline]
-fn resolve_h(links: &IdMap<Key>, h: Key) -> Key {
-    match links.get(&h) {
-        Some(k) => *k,
-        None => h,
+/// user-id hash -> person key (the hash of the person's name), for every linked id.
+/// Flat open-addressed table so lookups can be prefetched ahead (most are DRAM misses).
+struct LinkTable {
+    slots: Vec<(Key, Key)>, // (id hash, person key); id hash (0,0) = empty
+    mask: usize,
+    zero: Option<Key>, // person key of an id whose hash is (0,0), if any
+}
+impl LinkTable {
+    fn new(pairs: impl ExactSizeIterator<Item = (Key, Key)>) -> Self {
+        let cap = (pairs.len() * 2).next_power_of_two().max(16);
+        let mut t = LinkTable { slots: vec![((0, 0), (0, 0)); cap], mask: cap - 1, zero: None };
+        for (k, v) in pairs {
+            if k == (0, 0) {
+                t.zero = Some(v);
+                continue;
+            }
+            let mut i = k.1 as usize & t.mask;
+            while t.slots[i].0 != (0, 0) && t.slots[i].0 != k {
+                i = (i + 1) & t.mask;
+            }
+            t.slots[i] = (k, v);
+        }
+        t
     }
+    #[inline(always)]
+    fn prefetch(&self, h: Key) {
+        let p = unsafe { self.slots.as_ptr().add(h.1 as usize & self.mask) } as *const u8;
+        prefetch(p);
+    }
+    #[inline(always)]
+    fn resolve(&self, h: Key) -> Key {
+        if h == (0, 0) {
+            return self.zero.unwrap_or(h);
+        }
+        let mut i = h.1 as usize & self.mask;
+        loop {
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.0 == h {
+                return s.1;
+            }
+            if s.0 == (0, 0) {
+                return h;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    /// Resolve `n` keys in place, prefetching ahead.
+    #[inline]
+    fn resolve_all<T>(&self, xs: &mut [T], key: impl Fn(&mut T) -> &mut Key) {
+        const D: usize = 16;
+        for i in 0..xs.len() {
+            if i + D < xs.len() {
+                let k = *key(&mut xs[i + D]);
+                self.prefetch(k);
+            }
+            let k = key(&mut xs[i]);
+            *k = self.resolve(*k);
+        }
+    }
+}
+
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags))
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
 }
 
 fn parse_manifest(s: &str) -> (i64, i64) {
@@ -440,7 +506,7 @@ fn slice_of(ptr: usize, len: u32) -> B {
     unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }
 }
 
-fn build_links(link_chunks: &[B]) -> (IdMap<Key>, IdMap<(usize, u32)>) {
+fn build_links(link_chunks: &[B]) -> (LinkTable, IdMap<(usize, u32)>) {
     struct LinkRow {
         a: Key,
         b: Key,
@@ -501,19 +567,19 @@ fn build_links(link_chunks: &[B]) -> (IdMap<Key>, IdMap<(usize, u32)>) {
             best[r] = i as u32;
         }
     }
-    let mut links: IdMap<Key> = IdMap::with_capacity_and_hasher(n, Default::default());
     let mut names: IdMap<(usize, u32)> = IdMap::default();
+    let mut pairs: Vec<(Key, Key)> = Vec::with_capacity(n);
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
         let bi = best[r] as usize;
         let key = hs[bi];
-        links.insert(hs[i], key);
+        pairs.push((hs[i], key));
         if i == bi {
             names.insert(key, (strs[bi].as_ptr() as usize, strs[bi].len() as u32));
         }
     }
     drop(link_rows);
-    (links, names)
+    (LinkTable::new(pairs.into_iter()), names)
 
 }
 
@@ -612,12 +678,13 @@ struct ClChunk {
     cls: Vec<Cl>,
     off: Vec<u32>, // NB2 + 1 offsets
 }
-fn bucket_clicks(raw: &[Vec<Cl>], links: &IdMap<Key>) -> Vec<ClChunk> {
+fn bucket_clicks(raw: &[Vec<Cl>], links: &LinkTable) -> Vec<ClChunk> {
     let kss = PerThread::<Vec<Key>>::new();
     raw.par_iter()
         .map(|scr| kss.with(|ks| {
             ks.clear();
-            ks.extend(scr.iter().map(|c| resolve_h(links, c.key)));
+            ks.extend(scr.iter().map(|c| c.key));
+            links.resolve_all(ks, |k| k);
             let bk = |k: &Key| ((k.0 >> 32) as usize * NB2) >> 32;
             let mut off = vec![0u32; NB2 + 1];
             for k in ks.iter() {
@@ -715,7 +782,7 @@ fn main() {
     let ev_chunks = chunks_of(&list_csv(&data_dir.join("events")));
     let cl_chunks_in = chunks_of(&list_csv(&data_dir.join("clicks")));
     let pctx = PCtx { ws, we, cat_of, unknown_cat, camp_of };
-    let mut links_out: Option<(IdMap<Key>, IdMap<(usize, u32)>)> = None;
+    let mut links_out: Option<(LinkTable, IdMap<(usize, u32)>)> = None;
     let mut cl_raw: Vec<Vec<Cl>> = vec![];
     let mut accs: Vec<ChunkOut> = vec![];
     rayon::scope(|s| {
@@ -780,8 +847,9 @@ fn main() {
                 if p.ev.a == INVALID {
                     continue;
                 }
-                surv.push(Ev { key: resolve_h(&links, p.ev.key), ..p.ev });
+                surv.push(p.ev);
             }
+            links.resolve_all(surv, |e| &mut e.key);
             let pb = |e: &Ev| ((e.key.0 >> 32) as usize * NB2) >> 32;
             let mut off = vec![0u32; NB2 + 1];
             for e in surv.iter() {
