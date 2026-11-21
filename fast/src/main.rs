@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod scan;
+#[cfg(test)]
+mod fuzz_tests;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -286,7 +290,7 @@ fn read_small(path: &Path) -> Vec<B> {
 }
 
 // ---------- records ----------
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct Pre {
     e: Key,
     ingest: i64,
@@ -357,9 +361,14 @@ fn parse_manifest(s: &str) -> (i64, i64) {
     (get(s, "\"window_start\""), get(s, "\"window_end\""))
 }
 
-/// `key` of the result is the hash of the raw user id (unresolved).
+#[cfg(test)]
 fn parse_event_line(line: B, ctx: &PCtx) -> Option<Pre> {
-    let [eid, user, ts, ing, typ, prod, price] = fields::<7>(line)?;
+    parse_event_fields(fields::<7>(line)?, ctx)
+}
+
+/// `key` of the result is the hash of the raw user id (unresolved).
+#[inline]
+fn parse_event_fields([eid, user, ts, ing, typ, prod, price]: [B; 7], ctx: &PCtx) -> Option<Pre> {
     if eid.is_empty() {
         return None;
     }
@@ -418,13 +427,13 @@ fn build_links(link_chunks: &[B]) -> (IdMap<Key>, IdMap<(usize, u32)>) {
         .par_iter()
         .map(|c| {
             let mut v = vec![];
-            for_lines(c, |l| {
-                if let Some([a, b]) = fields::<2>(l) {
+            scan::for_lines_split::<2>(c, |_, f| {
+                if let Some([a, b]) = f {
                     if !a.is_empty() && !b.is_empty() {
                         v.push(LinkRow { a: hash128(a), b: hash128(b), sa: a, sb: b });
                     }
                 }
-            });
+            }, fields::<2>);
             v
         })
         .collect();
@@ -499,11 +508,15 @@ fn parse_events(ev_chunks: &[B], ctx: &PCtx) -> Vec<ChunkOut> {
         .map_init(Vec::<Pre>::new, |scratch, c| {
             scratch.clear();
             scratch.reserve(c.len() / 64 + 16);
-            for_lines(c, |l| {
-                if let Some(p) = parse_event_line(l, ctx) {
-                    scratch.push(p);
-                }
-            });
+            scan::for_lines_split::<7>(
+                c,
+                |_, f| {
+                    if let Some(p) = f.and_then(|f| parse_event_fields(f, ctx)) {
+                        scratch.push(p);
+                    }
+                },
+                fields::<7>,
+            );
             let bk = |p: &Pre| ((p.e.0 >> 32) as usize * NB1) >> 32;
             let mut off = vec![0u32; NB1 + 1];
             for p in scratch.iter() {
@@ -534,8 +547,8 @@ fn parse_clicks(cl_chunks: &[B], ctx: &PCtx) -> Vec<Vec<Cl>> {
         .par_iter()
         .map(|c| {
             let mut v: Vec<Cl> = Vec::with_capacity(c.len() / 40 + 16);
-            for_lines(c, |l| {
-                let Some([cid, user, camp, ts]) = fields::<4>(l) else { return };
+            scan::for_lines_split::<4>(c, |_, f| {
+                let Some([cid, user, camp, ts]) = f else { return };
                 if cid.is_empty() || user.is_empty() {
                     return;
                 }
@@ -545,7 +558,7 @@ fn parse_clicks(cl_chunks: &[B], ctx: &PCtx) -> Vec<Vec<Cl>> {
                 }
                 let Some(&ci) = ctx.camp_of.get(&hash128(camp)) else { return };
                 v.push(Cl { key: hash128(user), ts: t, cptr: cid.as_ptr() as usize, clen: cid.len() as u32, camp: ci });
-            });
+            }, fields::<4>);
             v
         })
         .collect()
