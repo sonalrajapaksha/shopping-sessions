@@ -3,3 +3,7 @@ dev/
 out/
 *.md
 .git
+fast/target
+data/
+benchmarks/results
+.venv

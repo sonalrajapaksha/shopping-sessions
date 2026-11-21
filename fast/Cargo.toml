@@ -1,0 +1,22 @@
+[package]
+name = "shopping-fast"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "shopping-fast"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[dependencies]
+memchr = "2.8.3"
+memmap2 = "0.9.12"
+parquet = { version = "60.1.0", default-features = false }
+rayon = "1.12.0"

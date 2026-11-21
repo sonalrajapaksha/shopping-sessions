@@ -11,3 +11,4 @@ scratch/
 benchmarks/results/
 .DS_Store
 .tmp/
+fast/target/
