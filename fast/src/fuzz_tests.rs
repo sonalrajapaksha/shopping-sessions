@@ -205,7 +205,7 @@ fn fuzz_event_records() {
         for_lines(chunk, |l| want.push(parse_event_line(l, &ctx)));
         let mut got = vec![];
         scan::for_lines_split::<7>(chunk, |_, f| got.push(f.and_then(|f| parse_event_fields(f, &ctx))), fields::<7>);
-        ok += want.iter().filter(|p| p.map_or(false, |p| p.ts != i64::MIN)).count();
+        ok += want.iter().filter(|p| p.map_or(false, |p| p.ev.a != INVALID)).count();
         assert!(got == want, "event records differ");
     }
     eprintln!("event records: {n} lines, {ok} valid");

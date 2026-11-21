@@ -290,24 +290,50 @@ fn read_small(path: &Path) -> Vec<B> {
 }
 
 // ---------- records ----------
+/// One parsed event line (dedup input): 56 bytes.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Pre {
     e: Key,
     ingest: i64,
-    ts: i64, // i64::MIN = not ok
-    key: Key,
-    uptr: usize,
-    ulen: u32,
-    pc: u32, // price | cat << 24
+    ev: Ev, // ev.a == INVALID: the copy is not a valid surviving event
 }
 
-#[derive(Clone, Copy)]
+/// A valid event: 32 bytes.
+/// `a` = (ts - window_start) << 24 | price_cents (0 unless a valid purchase; < 2^24)
+/// `b` = user-id pointer (48 bits) | category << 56
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct Ev {
     key: Key,
-    ts: i64,
-    uptr: usize,
-    ulen: u32,
-    pc: u32,
+    a: u64,
+    b: u64,
+}
+const INVALID: u64 = u64::MAX;
+const PTR_MASK: u64 = (1 << 48) - 1;
+/// The packed `a` holds ts - window_start in 40 bits.
+const MAX_SPAN: i64 = 1 << 40;
+impl Ev {
+    #[inline(always)]
+    fn ts(&self, ws: i64) -> i64 {
+        ws + (self.a >> 24) as i64
+    }
+    #[inline(always)]
+    fn price(&self) -> u32 {
+        (self.a & 0xFF_FFFF) as u32
+    }
+    #[inline(always)]
+    fn cat(&self) -> usize {
+        (self.b >> 56) as usize
+    }
+    /// The raw user id; it ends at the closing quote or the comma after it.
+    fn user(&self) -> B {
+        let p = (self.b & PTR_MASK) as usize as *const u8;
+        let mut n = 0usize;
+        // SAFETY: the user field is followed by ',' (more fields follow it) in the same mapping
+        while unsafe { !matches!(*p.add(n), b',' | b'"') } {
+            n += 1;
+        }
+        unsafe { std::slice::from_raw_parts(p, n) }
+    }
 }
 
 /// Deduped events of one dedup bucket, grouped by person bucket (counting-sorted).
@@ -374,7 +400,7 @@ fn parse_event_fields([eid, user, ts, ing, typ, prod, price]: [B; 7], ctx: &PCtx
     }
     let e = hash128(eid);
     let ingest = parse_ts(ing).unwrap_or(i64::MAX);
-    let mut p = Pre { e, ingest, ts: i64::MIN, key: (0, 0), uptr: 0, ulen: 0, pc: 0 };
+    let mut p = Pre { e, ingest, ev: Ev { key: (0, 0), a: INVALID, b: 0 } };
     if user.is_empty() || prod.is_empty() {
         return Some(p);
     }
@@ -404,11 +430,9 @@ fn parse_event_fields([eid, user, ts, ing, typ, prod, price]: [B; 7], ctx: &PCtx
         }
         _ => return Some(p),
     }
-    p.ts = t;
-    p.key = hash128(user);
-    p.uptr = user.as_ptr() as usize;
-    p.ulen = user.len() as u32;
-    p.pc = pc;
+    let uptr = user.as_ptr() as u64;
+    debug_assert!(uptr <= PTR_MASK);
+    p.ev = Ev { key: hash128(user), a: ((t - ctx.ws) as u64) << 24 | (pc & 0xFF_FFFF) as u64, b: uptr | ((pc >> 24) as u64) << 56 };
     Some(p)
 }
 
@@ -631,6 +655,8 @@ fn main() {
 
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let (ws, we) = parse_manifest(&manifest);
+    // event timestamps are stored as 40-bit offsets from window_start (windows up to ~34 years)
+    assert!(we - ws <= MAX_SPAN, "event window longer than 2^40 ms is not supported");
 
     // products, campaigns
     let mut cats: Vec<B> = vec![];
@@ -730,10 +756,10 @@ fn main() {
                     continue;
                 }
                 let p = &accs[k.ai as usize].recs[k.pos as usize];
-                if p.ts == i64::MIN {
+                if p.ev.a == INVALID {
                     continue;
                 }
-                surv.push(Ev { key: resolve_h(&links, p.key), ts: p.ts, uptr: p.uptr, ulen: p.ulen, pc: p.pc });
+                surv.push(Ev { key: resolve_h(&links, p.ev.key), ..p.ev });
             }
             let pb = |e: &Ev| ((e.key.0 >> 32) as usize * NB2) >> 32;
             let mut off = vec![0u32; NB2 + 1];
@@ -800,7 +826,7 @@ fn main() {
                 for ch in &cl_chunks {
                     cls.extend_from_slice(&ch.cls[ch.off[p] as usize..ch.off[p + 1] as usize]);
                 }
-                evs.sort_unstable_by_key(|e| (e.key, e.ts));
+                evs.sort_unstable_by_key(|e| (e.key, e.a));
                 cls.sort_unstable_by_key(|c| (c.key, c.ts));
                 // tie-break equal (key, ts) by click_id bytes
                 let mut i = 0;
@@ -829,7 +855,7 @@ fn main() {
                     while ce < cls.len() && cls[ce].key == key {
                         ce += 1;
                     }
-                    process_person(&mut w, &evs[s..e], &cls[ci..ce], &names, ncamp, day0, ndays, ncat);
+                    process_person(&mut w, &evs[s..e], &cls[ci..ce], &names, ncamp, day0, ndays, ncat, ws);
                     ci = ce;
                     s = e;
                 }
@@ -868,11 +894,15 @@ fn process_person(
     day0: i64,
     ndays: usize,
     ncat: usize,
+    ws: i64,
 ) {
     let key = evs[0].key;
     let (nptr, nlen) = match names.get(&key) {
         Some(&(p, l)) => (p, l),
-        None => (evs[0].uptr, evs[0].ulen),
+        None => {
+            let u = evs[0].user();
+            (u.as_ptr() as usize, u.len() as u32)
+        }
     };
     let organic = ncamp;
     let (mut lo, mut hi) = (0usize, 0usize);
@@ -925,11 +955,12 @@ fn process_person(
     }
 
     for e in evs {
-        let new_sess = !in_sess || e.ts - prev_ts > GAP_MS;
-        prev_ts = e.ts;
+        let ets = e.ts(ws);
+        let new_sess = !in_sess || ets - prev_ts > GAP_MS;
+        prev_ts = ets;
         if new_sess {
             close_sess!();
-            let s = e.ts;
+            let s = ets;
             let day = s.div_euclid(DAY_MS);
             if day != cur_day {
                 flush_day!();
@@ -982,11 +1013,11 @@ fn process_person(
             in_sess = true;
         }
         s_cnt += 1;
-        let price = e.pc & 0xFF_FFFF;
+        let price = e.price();
         if price > 0 {
             s_rev += price as u64;
             d_purch = true;
-            w.cat_sum[(e.pc >> 24) as usize] += price as u64;
+            w.cat_sum[e.cat()] += price as u64;
         }
     }
     close_sess!();
