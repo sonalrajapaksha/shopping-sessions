@@ -434,6 +434,25 @@ fn main() {
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().unwrap();
 
+    // Warm the page cache ahead of the parsers: queue readahead for every input file in read order on a
+    // background thread (a cold read otherwise only gets the per-fault mmap readahead window).
+    #[cfg(target_os = "linux")]
+    {
+        let mut files: Vec<PathBuf> = vec![data_dir.join("products.csv"), data_dir.join("campaigns.csv")];
+        for d in ["links", "events", "clicks"] {
+            files.extend(list_csv(&data_dir.join(d)));
+        }
+        std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            for p in files {
+                if let Ok(f) = std::fs::File::open(&p) {
+                    let len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+                    unsafe { libc::readahead(f.as_raw_fd(), 0, len) };
+                }
+            }
+        });
+    }
+
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let (ws, we) = parse_manifest(&manifest);
 
