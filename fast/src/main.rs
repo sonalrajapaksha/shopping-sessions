@@ -327,19 +327,19 @@ struct Cl {
     camp: u32,
 }
 
-struct Ctx {
+/// Parse-time context: everything except links (which are built concurrently with parsing).
+struct PCtx {
     ws: i64,
     we: i64,
     cat_of: IdMap<u8>,
     unknown_cat: u8,
     camp_of: IdMap<u32>,
-    links: IdMap<Key>,
 }
 
+/// Map a user-id hash to its person key (the hash of the person's name).
 #[inline]
-fn resolve(ctx: &Ctx, user: B) -> Key {
-    let h = hash128(user);
-    match ctx.links.get(&h) {
+fn resolve_h(links: &IdMap<Key>, h: Key) -> Key {
+    match links.get(&h) {
         Some(k) => *k,
         None => h,
     }
@@ -357,7 +357,8 @@ fn parse_manifest(s: &str) -> (i64, i64) {
     (get(s, "\"window_start\""), get(s, "\"window_end\""))
 }
 
-fn parse_event_line(line: B, ctx: &Ctx) -> Option<Pre> {
+/// `key` of the result is the hash of the raw user id (unresolved).
+fn parse_event_line(line: B, ctx: &PCtx) -> Option<Pre> {
     let [eid, user, ts, ing, typ, prod, price] = fields::<7>(line)?;
     if eid.is_empty() {
         return None;
@@ -395,7 +396,7 @@ fn parse_event_line(line: B, ctx: &Ctx) -> Option<Pre> {
         _ => return Some(p),
     }
     p.ts = t;
-    p.key = resolve(ctx, user);
+    p.key = hash128(user);
     p.uptr = user.as_ptr() as usize;
     p.ulen = user.len() as u32;
     p.pc = pc;
@@ -406,75 +407,13 @@ fn slice_of(ptr: usize, len: u32) -> B {
     unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }
 }
 
-// ---------- worker accumulator ----------
-struct UdRow {
-    nptr: usize,
-    nlen: u32,
-    day: i32,
-    sessions: u32,
-    events: u32,
-    revenue: u64,
-    top: u8, // 255 = null
-}
-
-struct Worker {
-    camp: Vec<[u64; 5]>, // sessions, purchasing, revenue, assisted
-    ud: Vec<UdRow>,
-    cnt: Vec<u32>,
-    pos: Vec<u32>,
-    active: Vec<u32>,
-    cat_sum: Vec<u64>,
-}
-
-fn main() {
-    let t0 = Instant::now();
-    let tm = |label: &str| eprintln!("[{:7.2}s] {}", t0.elapsed().as_secs_f64(), label);
-    let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
-    let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
-    let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().unwrap();
-
-    let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
-    let (ws, we) = parse_manifest(&manifest);
-
-    // products, campaigns
-    let mut cats: Vec<B> = vec![];
-    let mut prod_rows: Vec<(B, B)> = vec![];
-    for l in read_small(&data_dir.join("products.csv")) {
-        if let Some([p, c]) = fields::<2>(l) {
-            prod_rows.push((p, c));
-            cats.push(c);
-        }
-    }
-    cats.sort();
-    cats.dedup();
-    let unknown_cat = cats.len() as u8;
-    let mut cat_of: IdMap<u8> = IdMap::default();
-    for (p, c) in &prod_rows {
-        cat_of.insert(hash128(p), cats.binary_search(c).unwrap() as u8);
-    }
-    let mut camp_names: Vec<(B, B)> = vec![];
-    let mut camp_of: IdMap<u32> = IdMap::default();
-    for l in read_small(&data_dir.join("campaigns.csv")) {
-        if let Some([c, ch]) = fields::<2>(l) {
-            let h = hash128(c);
-            if !camp_of.contains_key(&h) {
-                camp_of.insert(h, camp_names.len() as u32);
-                camp_names.push((c, ch));
-            }
-        }
-    }
-    let ncamp = camp_names.len();
-    tm("small files");
-
-    // ---- links ----
+fn build_links(link_chunks: &[B]) -> (IdMap<Key>, IdMap<(usize, u32)>) {
     struct LinkRow {
         a: Key,
         b: Key,
         sa: B,
         sb: B,
     }
-    let link_chunks = chunks_of(&list_csv(&data_dir.join("links")));
     let link_rows: Vec<Vec<LinkRow>> = link_chunks
         .par_iter()
         .map(|c| {
@@ -541,25 +480,27 @@ fn main() {
         }
     }
     drop(link_rows);
-    tm("links");
+    (links, names)
 
-    let ctx = Ctx { ws, we, cat_of, unknown_cat, camp_of, links };
+}
 
-    // ---- events: parse ----
-    let ev_chunks = chunks_of(&list_csv(&data_dir.join("events")));
-    // Each chunk is parsed into a reused per-thread scratch buffer, then counting-sorted by
-    // dedup bucket into one exactly-sized Vec (no doubling growth, no 256 x accumulators).
-    struct ChunkOut {
-        recs: Vec<Pre>,
-        off: Vec<u32>, // NB1 + 1
-    }
-    let accs: Vec<ChunkOut> = ev_chunks
+// ---------- parse phases ----------
+/// Parsed events of one chunk, counting-sorted by dedup bucket.
+struct ChunkOut {
+    recs: Vec<Pre>,
+    off: Vec<u32>, // NB1 + 1
+}
+
+/// Each chunk is parsed into a reused per-thread scratch buffer, then counting-sorted by
+/// dedup bucket into one exactly-sized Vec (no doubling growth, no 256 x accumulators).
+fn parse_events(ev_chunks: &[B], ctx: &PCtx) -> Vec<ChunkOut> {
+    ev_chunks
         .par_iter()
         .map_init(Vec::<Pre>::new, |scratch, c| {
             scratch.clear();
             scratch.reserve(c.len() / 64 + 16);
             for_lines(c, |l| {
-                if let Some(p) = parse_event_line(l, &ctx) {
+                if let Some(p) = parse_event_line(l, ctx) {
                     scratch.push(p);
                 }
             });
@@ -583,8 +524,149 @@ fn main() {
             unsafe { recs.set_len(n) };
             ChunkOut { recs, off }
         })
-        .collect();
-    tm("events parsed");
+        .collect()
+}
+
+/// Valid clicks of each chunk, in file order; `key` is the hash of the raw user id (unresolved).
+fn parse_clicks(cl_chunks: &[B], ctx: &PCtx) -> Vec<Vec<Cl>> {
+    let (ws, we) = (ctx.ws, ctx.we);
+    cl_chunks
+        .par_iter()
+        .map(|c| {
+            let mut v: Vec<Cl> = Vec::with_capacity(c.len() / 40 + 16);
+            for_lines(c, |l| {
+                let Some([cid, user, camp, ts]) = fields::<4>(l) else { return };
+                if cid.is_empty() || user.is_empty() {
+                    return;
+                }
+                let Some(t) = parse_ts(ts) else { return };
+                if t < ws - WEEK_MS || t >= we {
+                    return;
+                }
+                let Some(&ci) = ctx.camp_of.get(&hash128(camp)) else { return };
+                v.push(Cl { key: hash128(user), ts: t, cptr: cid.as_ptr() as usize, clen: cid.len() as u32, camp: ci });
+            });
+            v
+        })
+        .collect()
+}
+
+/// Resolve click users to person keys and counting-sort each chunk by person bucket.
+struct ClChunk {
+    cls: Vec<Cl>,
+    off: Vec<u32>, // NB2 + 1 offsets
+}
+fn bucket_clicks(raw: &[Vec<Cl>], links: &IdMap<Key>) -> Vec<ClChunk> {
+    raw.par_iter()
+        .map_init(Vec::<Key>::new, |ks, scr| {
+            ks.clear();
+            ks.extend(scr.iter().map(|c| resolve_h(links, c.key)));
+            let bk = |k: &Key| ((k.0 >> 32) as usize * NB2) >> 32;
+            let mut off = vec![0u32; NB2 + 1];
+            for k in ks.iter() {
+                off[bk(k) + 1] += 1;
+            }
+            for i in 0..NB2 {
+                off[i + 1] += off[i];
+            }
+            let n = scr.len();
+            let mut cls: Vec<Cl> = Vec::with_capacity(n);
+            let mut cur: Vec<u32> = off[..NB2].to_vec();
+            let dst = cls.as_mut_ptr();
+            for (i, k) in ks.iter().enumerate() {
+                let b = bk(k);
+                let d = cur[b] as usize;
+                cur[b] += 1;
+                let mut c = scr[i];
+                c.key = *k;
+                // SAFETY: d < n by construction of the prefix sums; each slot written once.
+                unsafe { dst.add(d).write(c) };
+            }
+            unsafe { cls.set_len(n) };
+            ClChunk { cls, off }
+        })
+        .collect()
+}
+
+// ---------- worker accumulator ----------
+struct UdRow {
+    nptr: usize,
+    nlen: u32,
+    day: i32,
+    sessions: u32,
+    events: u32,
+    revenue: u64,
+    top: u8, // 255 = null
+}
+
+struct Worker {
+    camp: Vec<[u64; 5]>, // sessions, purchasing, revenue, assisted
+    ud: Vec<UdRow>,
+    cnt: Vec<u32>,
+    pos: Vec<u32>,
+    active: Vec<u32>,
+    cat_sum: Vec<u64>,
+}
+
+fn main() {
+    let t0 = Instant::now();
+    let tm = |label: &str| eprintln!("[{:7.2}s] {}", t0.elapsed().as_secs_f64(), label);
+    let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
+    let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
+    let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().unwrap();
+
+    let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
+    let (ws, we) = parse_manifest(&manifest);
+
+    // products, campaigns
+    let mut cats: Vec<B> = vec![];
+    let mut prod_rows: Vec<(B, B)> = vec![];
+    for l in read_small(&data_dir.join("products.csv")) {
+        if let Some([p, c]) = fields::<2>(l) {
+            prod_rows.push((p, c));
+            cats.push(c);
+        }
+    }
+    cats.sort();
+    cats.dedup();
+    let unknown_cat = cats.len() as u8;
+    let mut cat_of: IdMap<u8> = IdMap::default();
+    for (p, c) in &prod_rows {
+        cat_of.insert(hash128(p), cats.binary_search(c).unwrap() as u8);
+    }
+    let mut camp_names: Vec<(B, B)> = vec![];
+    let mut camp_of: IdMap<u32> = IdMap::default();
+    for l in read_small(&data_dir.join("campaigns.csv")) {
+        if let Some([c, ch]) = fields::<2>(l) {
+            let h = hash128(c);
+            if !camp_of.contains_key(&h) {
+                camp_of.insert(h, camp_names.len() as u32);
+                camp_names.push((c, ch));
+            }
+        }
+    }
+    let ncamp = camp_names.len();
+    tm("small files");
+
+    // ---- phase 1: links, events and clicks are parsed concurrently ----
+    // Event and click user IDs are hashed but not resolved here (links may still be running);
+    // resolution happens on dedup survivors and in the click bucketing pass.
+    let link_chunks = chunks_of(&list_csv(&data_dir.join("links")));
+    let ev_chunks = chunks_of(&list_csv(&data_dir.join("events")));
+    let cl_chunks_in = chunks_of(&list_csv(&data_dir.join("clicks")));
+    let pctx = PCtx { ws, we, cat_of, unknown_cat, camp_of };
+    let mut links_out: Option<(IdMap<Key>, IdMap<(usize, u32)>)> = None;
+    let mut cl_raw: Vec<Vec<Cl>> = vec![];
+    let mut accs: Vec<ChunkOut> = vec![];
+    rayon::scope(|s| {
+        // spawned first so an idle thread steals it first: its serial union-find overlaps parsing
+        s.spawn(|_| links_out = Some(build_links(&link_chunks)));
+        s.spawn(|_| cl_raw = parse_clicks(&cl_chunks_in, &pctx));
+        accs = parse_events(&ev_chunks, &pctx);
+    });
+    let (links, names) = links_out.unwrap();
+    tm("parsed");
 
     // ---- dedup + repartition by person ----
     // compact 32-byte sort keys; payload stays in place and is gathered for survivors
@@ -595,7 +677,7 @@ fn main() {
         ai: u32,
         pos: u32,
     }
-    let parts: Vec<Part> = (0..NB1)
+    let dedup = || -> Vec<Part> { (0..NB1)
         .into_par_iter()
         .map_init(|| (Vec::<SK>::new(), Vec::<Ev>::new()), |(v, surv), b| {
             let sl = |a: &ChunkOut| (a.off[b] as usize, a.off[b + 1] as usize);
@@ -621,7 +703,7 @@ fn main() {
                 if p.ts == i64::MIN {
                     continue;
                 }
-                surv.push(Ev { key: p.key, ts: p.ts, uptr: p.uptr, ulen: p.ulen, pc: p.pc });
+                surv.push(Ev { key: resolve_h(&links, p.key), ts: p.ts, uptr: p.uptr, ulen: p.ulen, pc: p.pc });
             }
             let pb = |e: &Ev| ((e.key.0 >> 32) as usize * NB2) >> 32;
             let mut off = vec![0u32; NB2 + 1];
@@ -643,63 +725,11 @@ fn main() {
             unsafe { evs.set_len(n) };
             Part { evs, off }
         })
-        .collect();
+        .collect() };
+    let (parts, cl_chunks) = rayon::join(dedup, || bucket_clicks(&cl_raw, &links));
     drop(accs);
-    tm("dedup");
-
-    // ---- clicks ----
-    // Each chunk is parsed into a reused per-thread scratch, then counting-sorted by person
-    // bucket into one exactly-sized Vec (no growth reallocs / fresh-page faults).
-    struct ClChunk {
-        cls: Vec<Cl>,
-        off: Vec<u32>, // NB2 + 1 offsets
-    }
-    let cl_chunks_in = chunks_of(&list_csv(&data_dir.join("clicks")));
-    let cl_chunks: Vec<ClChunk> = cl_chunks_in
-        .par_iter()
-        .map_init(
-            || (Vec::<Cl>::new(), Vec::<u16>::new()),
-            |(scr, bk), c| {
-                scr.clear();
-                bk.clear();
-                for_lines(c, |l| {
-                    let Some([cid, user, camp, ts]) = fields::<4>(l) else { return };
-                    if cid.is_empty() || user.is_empty() {
-                        return;
-                    }
-                    let Some(t) = parse_ts(ts) else { return };
-                    if t < ws - WEEK_MS || t >= we {
-                        return;
-                    }
-                    let Some(&ci) = ctx.camp_of.get(&hash128(camp)) else { return };
-                    let key = resolve(&ctx, user);
-                    let pb = ((key.0 >> 32) as usize * NB2) >> 32;
-                    bk.push(pb as u16);
-                    scr.push(Cl { key, ts: t, cptr: cid.as_ptr() as usize, clen: cid.len() as u32, camp: ci });
-                });
-                let mut off = vec![0u32; NB2 + 1];
-                for &b in bk.iter() {
-                    off[b as usize + 1] += 1;
-                }
-                for i in 0..NB2 {
-                    off[i + 1] += off[i];
-                }
-                let n = scr.len();
-                let mut cls: Vec<Cl> = Vec::with_capacity(n);
-                let mut cur: Vec<u32> = off[..NB2].to_vec();
-                let dst = cls.as_mut_ptr();
-                for (i, &b) in bk.iter().enumerate() {
-                    let d = cur[b as usize] as usize;
-                    cur[b as usize] += 1;
-                    // SAFETY: d < n by construction of the prefix sums; each slot written once.
-                    unsafe { dst.add(d).write(scr[i]) };
-                }
-                unsafe { cls.set_len(n) };
-                ClChunk { cls, off }
-            },
-        )
-        .collect();
-    tm("clicks parsed");
+    drop(cl_raw);
+    tm("dedup + clicks bucketed");
 
     // ---- sessionize + attribute ----
     // Exactly one Worker (and one set of scratch buffers) per thread; buckets are handed out dynamically.
