@@ -830,6 +830,11 @@ fn process_person(
 }
 
 // ---------- parquet ----------
+#[inline]
+fn ba(s: B) -> ByteArray {
+    ByteArray::from(bytes::Bytes::from_static(s))
+}
+
 fn props() -> Arc<WriterProperties> {
     Arc::new(
         WriterProperties::builder()
@@ -851,7 +856,7 @@ fn write_user_daily(dir: &Path, workers: &[Worker], cats: &[B]) {
     let mut jobs: Vec<(usize, &[UdRow])> = vec![];
     let mut idx = 0;
     for w in workers {
-        for ch in w.ud.chunks(1_000_000) {
+        for ch in w.ud.chunks(131_072) {
             jobs.push((idx, ch));
             idx += 1;
         }
@@ -864,7 +869,7 @@ fn write_user_daily(dir: &Path, workers: &[Worker], cats: &[B]) {
         let mut w = SerializedFileWriter::new(f, schema.clone(), p.clone()).unwrap();
         let mut rg = w.next_row_group().unwrap();
         let mut c = rg.next_column().unwrap().unwrap();
-        let v: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(slice_of(r.nptr, r.nlen))).collect();
+        let v: Vec<ByteArray> = rows.iter().map(|r| ba(slice_of(r.nptr, r.nlen))).collect();
         c.typed::<ByteArrayType>().write_batch(&v, None, None).unwrap();
         c.close().unwrap();
         let mut c = rg.next_column().unwrap().unwrap();
@@ -892,7 +897,7 @@ fn write_user_daily(dir: &Path, workers: &[Worker], cats: &[B]) {
             } else {
                 defs.push(1);
                 let name: &[u8] = if (r.top as usize) < cats.len() { cats[r.top as usize] } else { b"unknown" };
-                vals.push(ByteArray::from(name));
+                vals.push(ba(name));
             }
         }
         c.typed::<ByteArrayType>().write_batch(&vals, Some(&defs), None).unwrap();
@@ -920,8 +925,8 @@ fn write_campaign_daily(dir: &Path, tot: &[[u64; 5]], camps: &[(B, B)], day0: i6
                 continue;
             }
             let (id, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { camps[c] };
-            ids.push(ByteArray::from(id));
-            chs.push(ByteArray::from(ch));
+            ids.push(ba(id));
+            chs.push(ba(ch));
             days.push((day0 + d as i64) as i32);
             cols[0].push(a[0] as i64);
             cols[1].push(a[1] as i64);
