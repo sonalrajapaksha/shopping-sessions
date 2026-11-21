@@ -305,6 +305,18 @@ struct Ev {
     pc: u32,
 }
 
+/// Deduped events of one dedup bucket, grouped by person bucket (counting-sorted).
+struct Part {
+    evs: Vec<Ev>,
+    off: Vec<u32>, // NB2 + 1
+}
+impl Part {
+    #[inline]
+    fn get(&self, p: usize) -> &[Ev] {
+        &self.evs[self.off[p] as usize..self.off[p + 1] as usize]
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Cl {
     key: Key,
@@ -534,28 +546,51 @@ fn main() {
 
     // ---- events: parse ----
     let ev_chunks = chunks_of(&list_csv(&data_dir.join("events")));
-    let accs: Vec<Vec<Vec<Pre>>> = ev_chunks
+    // Each chunk is parsed into a reused per-thread scratch buffer, then counting-sorted by
+    // dedup bucket into one exactly-sized Vec (no doubling growth, no 256 x accumulators).
+    struct ChunkOut {
+        recs: Vec<Pre>,
+        off: Vec<u32>, // NB1 + 1
+    }
+    let accs: Vec<ChunkOut> = ev_chunks
         .par_iter()
-        .fold(
-            || (0..NB1).map(|_| Vec::new()).collect::<Vec<Vec<Pre>>>(),
-            |mut acc, c| {
-                for_lines(c, |l| {
-                    if let Some(p) = parse_event_line(l, &ctx) {
-                        let b = ((p.e.0 >> 32) as usize * NB1) >> 32;
-                        acc[b].push(p);
-                    }
-                });
-                acc
-            },
-        )
+        .map_init(Vec::<Pre>::new, |scratch, c| {
+            scratch.clear();
+            scratch.reserve(c.len() / 64 + 16);
+            for_lines(c, |l| {
+                if let Some(p) = parse_event_line(l, &ctx) {
+                    scratch.push(p);
+                }
+            });
+            let bk = |p: &Pre| ((p.e.0 >> 32) as usize * NB1) >> 32;
+            let mut off = vec![0u32; NB1 + 1];
+            for p in scratch.iter() {
+                off[bk(p) + 1] += 1;
+            }
+            for i in 0..NB1 {
+                off[i + 1] += off[i];
+            }
+            let n = scratch.len();
+            let mut recs: Vec<Pre> = Vec::with_capacity(n);
+            let mut cur: Vec<u32> = off[..NB1].to_vec();
+            let dst = recs.as_mut_ptr();
+            for p in scratch.iter() {
+                let b = bk(p);
+                unsafe { dst.add(cur[b] as usize).write(*p) };
+                cur[b] += 1;
+            }
+            unsafe { recs.set_len(n) };
+            ChunkOut { recs, off }
+        })
         .collect();
     tm("events parsed");
 
     // ---- dedup + repartition by person ----
-    let parts: Vec<Vec<Vec<Ev>>> = (0..NB1)
+    let parts: Vec<Part> = (0..NB1)
         .into_par_iter()
         .map(|b| {
-            let total: usize = accs.iter().map(|a| a[b].len()).sum();
+            let sl = |a: &ChunkOut| (a.off[b] as usize, a.off[b + 1] as usize);
+            let total: usize = accs.iter().map(|a| { let (x, y) = sl(a); y - x }).sum();
             // compact 32-byte sort keys; payload stays in place and is gathered for survivors
             #[derive(Clone, Copy)]
             struct SK {
@@ -566,26 +601,45 @@ fn main() {
             }
             let mut v: Vec<SK> = Vec::with_capacity(total);
             for (ai, a) in accs.iter().enumerate() {
-                for (pos, p) in a[b].iter().enumerate() {
-                    v.push(SK { e: p.e, ingest: p.ingest, ai: ai as u32, pos: pos as u32 });
+                let (x, y) = sl(a);
+                for (i, p) in a.recs[x..y].iter().enumerate() {
+                    v.push(SK { e: p.e, ingest: p.ingest, ai: ai as u32, pos: (x + i) as u32 });
                 }
             }
             v.sort_unstable_by(|x, y| (x.e, x.ingest).cmp(&(y.e, y.ingest)));
-            let mut out: Vec<Vec<Ev>> = (0..NB2).map(|_| Vec::new()).collect();
+            let mut surv: Vec<Ev> = Vec::with_capacity(total);
             let mut last: Option<Key> = None;
             for k in &v {
                 if last == Some(k.e) {
                     continue;
                 }
                 last = Some(k.e);
-                let p = &accs[k.ai as usize][b][k.pos as usize];
+                let p = &accs[k.ai as usize].recs[k.pos as usize];
                 if p.ts == i64::MIN {
                     continue;
                 }
-                let pb = ((p.key.0 >> 32) as usize * NB2) >> 32;
-                out[pb].push(Ev { key: p.key, ts: p.ts, uptr: p.uptr, ulen: p.ulen, pc: p.pc });
+                surv.push(Ev { key: p.key, ts: p.ts, uptr: p.uptr, ulen: p.ulen, pc: p.pc });
             }
-            out
+            drop(v);
+            let pb = |e: &Ev| ((e.key.0 >> 32) as usize * NB2) >> 32;
+            let mut off = vec![0u32; NB2 + 1];
+            for e in &surv {
+                off[pb(e) + 1] += 1;
+            }
+            for i in 0..NB2 {
+                off[i + 1] += off[i];
+            }
+            let n = surv.len();
+            let mut evs: Vec<Ev> = Vec::with_capacity(n);
+            let mut cur: Vec<u32> = off[..NB2].to_vec();
+            let dst = evs.as_mut_ptr();
+            for e in &surv {
+                let q = pb(e);
+                unsafe { dst.add(cur[q] as usize).write(*e) };
+                cur[q] += 1;
+            }
+            unsafe { evs.set_len(n) };
+            Part { evs, off }
         })
         .collect();
     drop(accs);
@@ -637,7 +691,7 @@ fn main() {
             |mut w, p| {
                 let mut evs: Vec<Ev> = Vec::new();
                 for part in &parts {
-                    evs.extend_from_slice(&part[p]);
+                    evs.extend_from_slice(part.get(p));
                 }
                 if evs.is_empty() {
                     return w;
