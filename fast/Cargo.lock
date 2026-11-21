@@ -416,6 +416,7 @@ name = "shopping-fast"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
  "memchr",
  "memmap2",
  "mimalloc",

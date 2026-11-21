@@ -796,6 +796,8 @@ fn main() {
     tm("user_daily written");
     write_campaign_daily(&out_dir.join("campaign_daily"), &camp_tot, &camp_names, day0, ndays, ncamp);
     tm("written");
+    // Everything is on disk: skip dropping the big Vecs, allocator teardown and munmap.
+    unsafe { libc::_exit(0) }
 }
 
 #[allow(clippy::too_many_arguments)]
