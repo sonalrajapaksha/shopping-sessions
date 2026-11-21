@@ -699,6 +699,7 @@ fn main() {
     let _ = std::fs::create_dir_all(out_dir.join("user_daily"));
     let _ = std::fs::create_dir_all(out_dir.join("campaign_daily"));
     write_user_daily(&out_dir.join("user_daily"), &workers, &cats);
+    tm("user_daily written");
     write_campaign_daily(&out_dir.join("campaign_daily"), &camp_tot, &camp_names, day0, ndays, ncamp);
     tm("written");
 }
@@ -867,16 +868,24 @@ fn write_user_daily(dir: &Path, workers: &[Worker], cats: &[B]) {
         .unwrap(),
     );
     let p = props();
-    let mut jobs: Vec<(usize, &[UdRow])> = vec![];
+    let all: Vec<&Vec<UdRow>> = workers.iter().map(|w| &w.ud).collect();
+    let total: usize = all.iter().map(|v| v.len()).sum();
+    let nthreads = rayon::current_num_threads().max(1);
+    let per = ((total + nthreads * 2 - 1) / (nthreads * 2)).max(1);
+    let mut jobs: Vec<(usize, Vec<&UdRow>)> = vec![];
+    let mut cur: Vec<&UdRow> = Vec::with_capacity(per);
     let mut idx = 0;
-    for w in workers {
-        for ch in w.ud.chunks(131_072) {
-            jobs.push((idx, ch));
-            idx += 1;
+    for v in &all {
+        for r in v.iter() {
+            cur.push(r);
+            if cur.len() == per {
+                jobs.push((idx, std::mem::replace(&mut cur, Vec::with_capacity(per))));
+                idx += 1;
+            }
         }
     }
-    if jobs.is_empty() {
-        jobs.push((0, &[]));
+    if !cur.is_empty() || jobs.is_empty() {
+        jobs.push((idx, cur));
     }
     jobs.par_iter().for_each(|(i, rows)| {
         let f = std::fs::File::create(dir.join(format!("part-{:05}.parquet", i))).unwrap();
